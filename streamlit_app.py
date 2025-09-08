@@ -101,25 +101,103 @@ c3.subheader("Precision-Recall"); c3.altair_chart(pr_chart, use_container_width=
 
 st.divider()
 
-# ---------------- Runs & allocation ----------------
+# ---------------- Runs & allocation (live, stable) ----------------
 st.subheader("Runs & Allocation")
+
+# One-time init
+if "total_staff" not in st.session_state:
+    st.session_state.total_staff = 10
+if "staff_assign" not in st.session_state:
+    st.session_state.staff_assign = {row["name"]: int(row["staff"]) for _, row in runs.iterrows()}
+for _, row in runs.iterrows():
+    name = row["name"]
+    st.session_state.staff_assign.setdefault(name, int(row["staff"]))
+    st.session_state.setdefault(f"staff_input_{name}", st.session_state.staff_assign[name])
+
+def _cap_overflow():
+    pool = int(st.session_state.total_staff)
+    assign = st.session_state.staff_assign
+    total = sum(assign.values())
+    if total <= pool or total == 0:
+        # sync widgets to assignment (keeps things consistent)
+        for n, v in assign.items():
+            st.session_state[f"staff_input_{n}"] = int(v)
+        return
+
+    # Proportional scale + round, then distribute leftover
+    scale = pool / total
+    updated = {n: int(np.floor(v * scale)) for n, v in assign.items()}
+    leftover = pool - sum(updated.values())
+    fracs = sorted(((n, assign[n]*scale - np.floor(assign[n]*scale)) for n in assign),
+                   key=lambda x: x[1], reverse=True)
+    for i in range(leftover):
+        updated[fracs[i % len(fracs)][0]] += 1
+
+    # write back (both canonical + widgets)
+    for n, v in updated.items():
+        st.session_state.staff_assign[n] = int(v)
+        st.session_state[f"staff_input_{n}"] = int(v)
+
+def on_total_change():
+    _cap_overflow()
+
+def on_run_change(name: str):
+    # pull widget value → canonical state
+    new_val = int(st.session_state.get(f"staff_input_{name}", 0))
+    st.session_state.staff_assign[name] = new_val
+    _cap_overflow()
+
+# Controls
+st.number_input(
+    "Total available staff",
+    min_value=0, max_value=1000, step=1,
+    key="total_staff",
+    on_change=on_total_change
+)
+
 query = st.text_input("Search runs…", "")
 view = runs[runs["name"].str.contains(query, case=False, na=False)].copy()
 
-def bucket(x): 
-    return "High" if x>=0.75 else ("Moderate" if x>=0.45 else "Low")
+def bucket(x):
+    return "High" if x >= 0.75 else ("Moderate" if x >= 0.45 else "Low")
 
-for idx, row in view.iterrows():
-    a,b,c = st.columns([2,1,1])
+pool = int(st.session_state.total_staff)
+current_total = sum(st.session_state.staff_assign.values())
+
+for _, row in view.iterrows():
+    name = row["name"]
+    cur = int(st.session_state.staff_assign.get(name, 0))
+
+    # capacity left if this run stays at 'cur'
+    remaining_excl_this = pool - (current_total - cur)
+    # IMPORTANT: never let max drop below current (prevents Streamlit auto-clamping)
+    max_for_run = max(cur, cur + remaining_excl_this)
+
+    a, b, c = st.columns([2, 1, 1])
     with a:
-        st.markdown(f"**{row['name']}**  \n<small>{row['icon']} {row['type']}</small>", unsafe_allow_html=True)
+        st.markdown(f"**{name}**  \n<small>{row['icon']} {row['type']}</small>", unsafe_allow_html=True)
     with b:
         st.metric("Risk", f"{int(row['risk']*100)}%", bucket(row["risk"]))
     with c:
-        new_staff = st.number_input(f"Staff — {row['name']}", min_value=0, max_value=20, value=int(row["staff"]), key=f"staff_{idx}")
-        view.loc[idx, "staff"] = new_staff
+        st.number_input(
+            f"Staff — {name}",
+            min_value=0,
+            max_value=int(max_for_run),
+            step=1,
+            key=f"staff_input_{name}",
+            on_change=on_run_change,
+            args=(name,)  # <-- use args, not kwargs
+        )
 
-st.caption("Tip: these are demo numbers. Hook your model later to replace the risk function and charts.")
+assigned = sum(st.session_state.staff_assign.values())
+remaining = pool - assigned
+if remaining < 0:
+    st.error(f"Over-assigned by {-remaining} staff.")
+elif remaining == 0:
+    st.info("All staff assigned.")
+else:
+    st.success(f"Assigned {assigned}. Remaining: {remaining}.")
+
 
 # ---------------- Upload hook (for later) ----------------
 with st.expander("Optional: Upload a CSV (placeholder for your data)"):
