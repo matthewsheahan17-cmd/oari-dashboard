@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+from io import BytesIO
+from datetime import datetime
+
 
 st.set_page_config(page_title="OARI — Operator Dashboard", layout="wide")
 
@@ -205,3 +208,183 @@ with st.expander("Optional: Upload a CSV (placeholder for your data)"):
     if f is not None:
         df = pd.read_csv(f)
         st.write(df.head())
+
+# ==================== Data Upload & Template Tab ====================
+st.divider()
+st.subheader("Data & Upload")
+
+tab_dashboard, tab_upload = st.tabs(["📊 Dashboard (current)", "📥 Upload & Template"])
+
+# -- Template definition --
+TEMPLATE_COLUMNS = [
+    "Observation #", "Date", "Time", "Injured (Y/N)", "Rain (mm/hr)", "Air Temp (°C)",
+    "UV Index", "Wind (km/h)", "Humidity (%)", "Cloud Cover (%)",
+    "Snow Depth (cm)", "Visibility (m)", "Ski Run"
+]
+
+def make_template_df() -> pd.DataFrame:
+    demo = pd.DataFrame({
+        "Observation #": [1, 2, 3],
+        "Date": ["2025-01-20", "2025-01-20", "2025-01-21"],
+        "Time": ["09:30", "13:15", "15:45"],
+        "Injured (Y/N)": ["N", "Y", "N"],
+        "Rain (mm/hr)": [0.0, 0.6, 0.0],
+        "Air Temp (°C)": [-8, -5, -3],
+        "UV Index": [1, 2, 3],
+        "Wind (km/h)": [12, 30, 18],
+        "Humidity (%)": [70, 65, 60],
+        "Cloud Cover (%)": [40, 90, 20],
+        "Snow Depth (cm)": [120, 120, 121],
+        "Visibility (m)": [1000, 600, 1500],
+        "Ski Run": ["The Chute", "Western Sun", "Jack Rabbit"],
+    })
+    # Ensure column order
+    return demo[TEMPLATE_COLUMNS]
+
+def template_bytes() -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        make_template_df().to_excel(buf, index=False, sheet_name="OARI_Data")
+    buf.seek(0)
+    return buf.getvalue()
+
+with tab_upload:
+    st.markdown("### Upload observations or download the Excel template")
+
+    # Download button
+    st.download_button(
+        label="⬇️ Download Excel template",
+        data=template_bytes(),
+        file_name="OARI_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Download a blank template with the required columns."
+    )
+
+    st.write("— or —")
+
+    # Upload widget
+    up = st.file_uploader(
+        "Upload your Excel file (*.xlsx) with the exact headers",
+        type=["xlsx"],
+        accept_multiple_files=False
+    )
+
+    if up is not None:
+        try:
+            df_raw = pd.read_excel(up, engine="openpyxl")
+        except Exception as e:
+            st.error(f"Could not read Excel file: {e}")
+            st.stop()
+
+        # Validate columns
+        missing = [c for c in TEMPLATE_COLUMNS if c not in df_raw.columns]
+        if missing:
+            st.error(f"Missing required column(s): {', '.join(missing)}")
+            st.info("Tip: download the template above to match exact headers.")
+            st.dataframe(df_raw.head())
+            st.stop()
+
+        # Reorder to template order and make a working copy
+        df = df_raw[TEMPLATE_COLUMNS].copy()
+
+        # Parse / clean
+        # 1) Date & Time → combine to a single datetime (where possible)
+        def to_time(s):
+            try:
+                return datetime.strptime(str(s).strip(), "%H:%M").time()
+            except Exception:
+                return None
+
+        def to_date(s):
+            # Allow already-parsed dates or strings like YYYY-MM-DD
+            if isinstance(s, datetime):
+                return s.date()
+            try:
+                return pd.to_datetime(str(s)).date()
+            except Exception:
+                return None
+
+        df["Date_parsed"] = df["Date"].apply(to_date)
+        df["Time_parsed"] = df["Time"].apply(to_time)
+        df["DateTime"] = pd.to_datetime(
+            df["Date_parsed"].astype(str) + " " + df["Time_parsed"].astype(str),
+            errors="coerce"
+        )
+
+        # 2) Injured → boolean
+        def to_bool(y):
+            if str(y).strip().upper() in ("Y", "YES", "1", "TRUE"):
+                return True
+            if str(y).strip().upper() in ("N", "NO", "0", "FALSE"):
+                return False
+            return None
+
+        df["Injured"] = df["Injured (Y/N)"].apply(to_bool)
+
+        # 3) Numeric columns (coerce errors to NaN)
+        numeric_cols = [
+            "Rain (mm/hr)", "Air Temp (°C)", "UV Index", "Wind (km/h)",
+            "Humidity (%)", "Cloud Cover (%)", "Snow Depth (cm)", "Visibility (m)"
+        ]
+        for c in numeric_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # --- Display ---
+        st.success("File uploaded and parsed successfully.")
+        st.markdown("#### Preview")
+        st.dataframe(df.head(20), use_container_width=True)
+
+        # --- Quick interpretation widgets ---
+        st.markdown("#### Summary")
+        total_obs = len(df)
+        injuries = int(df["Injured"].fillna(False).sum())
+        injury_rate = (injuries / total_obs * 100) if total_obs else 0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total observations", total_obs)
+        c2.metric("Injuries", injuries)
+        c3.metric("Injury rate", f"{injury_rate:.1f}%")
+
+        # Injuries by Ski Run
+        st.markdown("#### Injuries by Ski Run")
+        by_run = (
+            df.groupby("Ski Run")
+              .agg(
+                  observations=("Ski Run", "size"),
+                  injuries=("Injured", lambda s: int(pd.Series(s).fillna(False).sum()))
+              )
+              .reset_index()
+        )
+        by_run["injury_rate_%"] = (by_run["injuries"] / by_run["observations"] * 100).round(1)
+
+        # Bar chart (Altair)
+        chart = (
+            alt.Chart(by_run)
+            .mark_bar()
+            .encode(
+                x=alt.X("Ski Run:N", sort="-y", title="Ski Run"),
+                y=alt.Y("injuries:Q", title="Injuries"),
+                tooltip=["Ski Run", "observations", "injuries", "injury_rate_%"]
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        # Descriptive statistics for numeric drivers
+        st.markdown("#### Conditions (descriptive stats)")
+        st.dataframe(df[numeric_cols].describe().T, use_container_width=True)
+
+        # Time-of-day distribution (if datetimes were parsed)
+        if df["DateTime"].notna().any():
+            st.markdown("#### Time-of-day distribution")
+            tmp = df[df["DateTime"].notna()].copy()
+            tmp["hour"] = tmp["DateTime"].dt.hour
+            hist = (
+                alt.Chart(tmp)
+                .mark_bar()
+                .encode(x=alt.X("hour:O", title="Hour of day"), y="count()")
+                .properties(height=220)
+            )
+            st.altair_chart(hist, use_container_width=True)
+        else:
+            st.info("Time values could not be parsed in some rows—check the Time column format (HH:MM).")

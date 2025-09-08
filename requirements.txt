@@ -2,3 +2,4 @@ streamlit
 pandas
 altair
 numpy
+openpyxl>=3.1
